@@ -22,6 +22,9 @@ import { decodeBase64String, hasTextExtension } from "./utils";
 import GitHubSyncPlugin from "./main";
 import { BlobReader, Entry, Uint8ArrayWriter, ZipReader } from "@zip.js/zip.js";
 
+// Must be the same as the id in manifest.json
+const PLUGIN_ID = "github-gitless-sync";
+
 interface SyncAction {
   type: "upload" | "download" | "delete_local" | "delete_remote";
   filePath: string;
@@ -82,6 +85,22 @@ export default class SyncManager {
       // We filter out the config dir since is always present so it's fine if we find it.
       folders.filter((f) => f !== this.vault.configDir).length === 0
     );
+  }
+
+  /**
+   * Returns true if the file is in the config dir but is specific to this
+   * device, so it must not be overwritten when downloading remote configs.
+   */
+  private isDeviceSpecificConfig(filePath: string): boolean {
+    const configDir = this.vault.configDir;
+    return [
+      // Obsidian recommends not syncing the workspace files
+      `${configDir}/workspace.json`,
+      `${configDir}/workspace-mobile.json`,
+      // Our own settings, they contain the token and the first sync state
+      // the user just set on this device.
+      `${configDir}/plugins/${PLUGIN_ID}/data.json`,
+    ].includes(filePath);
   }
 
   /**
@@ -216,11 +235,22 @@ export default class SyncManager {
         }
 
         if (
-          this.settings.syncConfigDir &&
-          targetPath.startsWith(this.vault.configDir) &&
+          !this.settings.syncConfigDir &&
+          targetPath.startsWith(`${this.vault.configDir}/`) &&
           targetPath !== `${this.vault.configDir}/${MANIFEST_FILE_NAME}`
         ) {
+          // The user doesn't want to sync configs, leave the local ones alone
           await this.logger.info("Skipped config", { targetPath });
+          return;
+        }
+
+        if (this.isDeviceSpecificConfig(targetPath)) {
+          // Even when syncing configs these files must stay as they are locally.
+          // The local config dir is never empty, when it conflicts with the
+          // remote one the remote wins for everything but these.
+          await this.logger.info("Skipped device specific config", {
+            targetPath,
+          });
           return;
         }
 
@@ -1035,6 +1065,15 @@ export default class SyncManager {
     }
     // Add them to the metadata store
     files.forEach((filePath: string) => {
+      if (
+        filePath === `${this.vault.configDir}/workspace.json` ||
+        filePath === `${this.vault.configDir}/workspace-mobile.json` ||
+        filePath === `${this.vault.configDir}/${LOG_FILE_NAME}`
+      ) {
+        // Obsidian recommends not syncing the workspace files, and the
+        // log file must never be synced.
+        return;
+      }
       this.metadataStore.data.files[filePath] = {
         path: filePath,
         sha: null,

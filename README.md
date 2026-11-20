@@ -92,6 +92,11 @@ It will sync the whole folder, that is `.obsidian` by default, including all plu
 Note that the `.obsidian` folder will always be present, this happens because the plugin
 needs to store some metadata to correctly sync
 
+To set up a new device from a repository that already contains configs: create an empty vault,
+install and configure this plugin, enable config sync, then sync. The remote configs overwrite the
+local ones, apart from the workspace files and this plugin's own settings. Restart Obsidian
+afterwards to apply them.
+
 > [!CAUTION]
 > DO NOT sync configs if your remote repository is public.
 > That will expose the token you used to sync.

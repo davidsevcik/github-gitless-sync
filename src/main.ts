@@ -159,6 +159,11 @@ export default class GitHubSyncPlugin extends Plugin {
         this.saveSettings();
         // Shown only if sync doesn't fail
         new Notice("Sync successful", 5000);
+        if (this.settings.syncConfigDir) {
+          // Obsidian doesn't pick up config changes on disk while running.
+          // Not automatically dismissed so the user sees it.
+          new Notice("Configs synced, restart Obsidian to apply them", 0);
+        }
       } catch (err) {
         // Show the error to the user, it's not automatically dismissed to make sure
         // the user sees it.

@@ -201,9 +201,7 @@ Bug fixes are always welcome, new feature must be discussed first. Open an [issu
 
 If your change makes sense for the original plugin too, consider contributing it [there](https://github.com/silvanocerza/github-gitless-sync).
 
-Keep PRs as small as possible, I won't review PRs with hundreds of lines if it's mostly code.
-
-Low quality or vibe coded PRs are not welcome. Put some effort in it please.
+Keep PRs as small as possible.
 
 ## License
 

@@ -34,6 +34,11 @@ export interface FileMetadata {
 
 export interface Metadata {
   lastSync: number;
+  // Identifies the remote repository and branch of the last successful sync,
+  // as far as the local environment is aware.
+  // If this matches the remote we're syncing with we know for sure that each
+  // file with a SHA has been in that remote at some point.
+  syncedWith?: string;
   files: { [key: string]: FileMetadata };
 }
 

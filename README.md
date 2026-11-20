@@ -97,6 +97,10 @@ install and configure this plugin, enable config sync, then sync. The remote con
 local ones, apart from the workspace files and this plugin's own settings. Restart Obsidian
 afterwards to apply them.
 
+Files added or removed in the config folder, like when you install or uninstall a plugin, are found
+when syncing. The same goes for any other hidden folder in your vault, those are always synced.
+`.git` and `.trash` folders are never synced, and neither are hidden files.
+
 > [!CAUTION]
 > DO NOT sync configs if your remote repository is public.
 > That will expose the token you used to sync.

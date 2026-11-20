@@ -73,6 +73,10 @@ export default class EventsListener {
       return;
     }
 
+    if (!this.metadataStore.data.files[filePath]) {
+      // We never tracked this file, there's nothing to mark as deleted
+      return;
+    }
     this.metadataStore.data.files[filePath].deleted = true;
     this.metadataStore.data.files[filePath].deletedAt = Date.now();
     await this.metadataStore.save();

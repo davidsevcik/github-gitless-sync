@@ -23,6 +23,16 @@ import GitHubSyncPlugin from "./main";
 import GitIgnore, { GITIGNORE_FILE_NAME } from "./gitignore";
 import { BlobReader, Entry, Uint8ArrayWriter, ZipReader } from "@zip.js/zip.js";
 
+// Hidden folders that must never be synced.
+// GitHub refuses any path containing .git, and .trash is where Obsidian
+// moves deleted files, if the user chose so.
+const UNSYNCABLE_FOLDERS = [".git", ".trash"];
+
+// How long we keep track of a deleted file after it's gone from the remote too.
+// It's only needed to decide what to do if the file has been deleted on a device
+// and edited on another one, after this we fall back to comparing its content.
+const DELETED_FILES_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+
 // Must be the same as the id in manifest.json
 const PLUGIN_ID = "github-gitless-sync";
 
@@ -110,12 +120,167 @@ export default class SyncManager {
   }
 
   /**
-   * Loads the ignore rules and updates the local metadata accordingly.
+   * Returns true if the file is in a hidden folder, meaning one whose name
+   * starts with a dot, at any depth. The config dir is one of those.
+   */
+  private isInHiddenFolder(filePath: string): boolean {
+    return filePath
+      .split("/")
+      .slice(0, -1)
+      .some((segment: string) => segment.startsWith("."));
+  }
+
+  /**
+   * Returns true if we must not look into the folder when searching
+   * for changes in hidden folders.
+   */
+  private isExcludedFolder(folder: string): boolean {
+    if (UNSYNCABLE_FOLDERS.includes(folder.split("/").last() as string)) {
+      return true;
+    }
+    if (!this.settings.syncConfigDir && folder === this.vault.configDir) {
+      // The user doesn't want to sync configs
+      return true;
+    }
+    return this.gitignore.ignores(`${folder}/`);
+  }
+
+  /**
+   * Returns true if the file in a hidden folder can be synced.
+   * The manifest is not considered as it's handled on its own.
+   */
+  private isSyncableHiddenFolderFile(filePath: string): boolean {
+    const configDir = this.vault.configDir;
+    if (
+      filePath === `${configDir}/${MANIFEST_FILE_NAME}` ||
+      // Obsidian recommends not syncing the workspace files
+      filePath === `${configDir}/workspace.json` ||
+      filePath === `${configDir}/workspace-mobile.json` ||
+      // The log file must never be synced
+      filePath === `${configDir}/${LOG_FILE_NAME}`
+    ) {
+      return false;
+    }
+    if (filePath.split("/").last()?.startsWith(".")) {
+      // Hidden files create issues with syncing
+      return false;
+    }
+    return !this.gitignore.ignores(filePath);
+  }
+
+  /**
+   * Makes sure the metadata reflects the files in hidden folders, the
+   * config dir included if the user wants to sync it.
+   * Obsidian doesn't send events for anything in there, so files that are
+   * created or deleted, like when installing or uninstalling a plugin, would
+   * go unnoticed if we didn't check those folders ourselves.
+   * Changes to the content of the files are found when syncing by comparing SHAs.
+   */
+  private async trackHiddenFoldersChanges() {
+    const configDir = this.vault.configDir;
+    const metadataFiles = this.metadataStore.data.files;
+
+    // Track new files, or files that have been created again after being deleted.
+    // Hidden folders can be anywhere so we need to go through all the folders,
+    // though we only care about the files in the hidden ones. We get events for
+    // all the others.
+    const folders = [this.vault.getRoot().path];
+    while (folders.length > 0) {
+      const folder = folders.pop() as string;
+      const res = await this.vault.adapter.list(folder);
+      folders.push(
+        ...res.folders.filter((f: string) => !this.isExcludedFolder(f)),
+      );
+      for (const filePath of res.files) {
+        if (
+          !this.isInHiddenFolder(filePath) ||
+          !this.isSyncableHiddenFolderFile(filePath)
+        ) {
+          continue;
+        }
+        const metadata = metadataFiles[filePath];
+        if (!metadata || metadata.deleted) {
+          await this.logger.info("Found new file in hidden folder", filePath);
+          metadataFiles[filePath] = {
+            path: filePath,
+            sha: null,
+            dirty: true,
+            justDownloaded: false,
+            lastModified: Date.now(),
+          };
+        }
+      }
+    }
+
+    // Mark as deleted the tracked files that don't exist anymore
+    await Promise.all(
+      Object.keys(metadataFiles)
+        .filter((filePath: string) => {
+          if (
+            metadataFiles[filePath].deleted ||
+            filePath === `${configDir}/${MANIFEST_FILE_NAME}` ||
+            !this.isInHiddenFolder(filePath)
+          ) {
+            return false;
+          }
+          // Leave alone the files in folders we don't look into
+          const segments = filePath.split("/").slice(0, -1);
+          return !segments.some((_: string, index: number) =>
+            this.isExcludedFolder(segments.slice(0, index + 1).join("/")),
+          );
+        })
+        .map(async (filePath: string) => {
+          if (await this.vault.adapter.exists(filePath)) {
+            return;
+          }
+          await this.logger.info("Found deleted file in hidden folder", filePath);
+          metadataFiles[filePath].deleted = true;
+          metadataFiles[filePath].deletedAt = Date.now();
+        }),
+    );
+  }
+
+  /**
+   * Identifies the remote repository and branch we're syncing with.
+   */
+  private remoteId(): string {
+    return `${this.settings.githubOwner}/${this.settings.githubRepo}@${this.settings.githubBranch}`;
+  }
+
+  /**
+   * Stops tracking the files that have been deleted long ago and are gone from
+   * the remote repository too. If we didn't the metadata would grow forever.
+   * Devices that still have those files find out they've been deleted because
+   * they're not in the remote anymore, see determineSyncActions.
+   *
+   * @param remoteTree All files in the remote repository
+   */
+  private removeExpiredDeletedFiles(remoteTree: {
+    [key: string]: GetTreeResponseItem;
+  }) {
+    const files = this.metadataStore.data.files;
+    const now = Date.now();
+    Object.keys(files)
+      .filter((filePath: string) => {
+        const file = files[filePath];
+        return (
+          file.deleted &&
+          !remoteTree[filePath] &&
+          now - (file.deletedAt ?? 0) > DELETED_FILES_RETENTION_MS
+        );
+      })
+      .forEach((filePath: string) => delete files[filePath]);
+  }
+
+  /**
+   * Updates the local metadata with the changes we can't get events for and
+   * loads the ignore rules.
    * Must be called before starting any sync.
    */
-  private async prepareIgnoredFiles() {
+  private async refreshLocalMetadata() {
     await this.gitignore.load();
     await this.trackGitignore();
+    await this.trackHiddenFoldersChanges();
     this.removeIgnoredFiles(this.metadataStore.data.files);
     await this.metadataStore.save();
   }
@@ -176,7 +341,7 @@ export default class SyncManager {
 
   private async firstSyncImpl() {
     await this.logger.info("Starting first sync");
-    await this.prepareIgnoredFiles();
+    await this.refreshLocalMetadata();
     let repositoryIsEmpty = false;
     let res: RepoContent;
     let files: {
@@ -523,7 +688,7 @@ export default class SyncManager {
 
   private async syncImpl() {
     await this.logger.info("Starting sync");
-    await this.prepareIgnoredFiles();
+    await this.refreshLocalMetadata();
     const { files, sha: treeSha } = await this.client.getRepoContent({
       retry: true,
     });
@@ -543,6 +708,8 @@ export default class SyncManager {
       // To avoid downloading it we delete it if still around.
       delete files[`${this.vault.configDir}/${LOG_FILE_NAME}`];
     }
+
+    this.removeExpiredDeletedFiles(files);
 
     const blob = await this.client.getBlob({ sha: manifest.sha });
     const remoteMetadata: Metadata = JSON.parse(
@@ -619,6 +786,7 @@ export default class SyncManager {
         remoteMetadata.files,
         this.metadataStore.data.files,
         conflictActions.map((action) => action.filePath),
+        files,
       )),
       ...conflictActions,
     ];
@@ -652,6 +820,8 @@ export default class SyncManager {
     if (actions.length === 0) {
       // Nothing to sync
       await this.logger.info("Nothing to sync");
+      this.metadataStore.data.syncedWith = this.remoteId();
+      await this.metadataStore.save();
       return;
     }
     await this.logger.info("Actions to sync", actions);
@@ -696,7 +866,10 @@ export default class SyncManager {
             break;
           }
           case "delete_remote": {
-            newTreeFiles[action.filePath].sha = null;
+            if (newTreeFiles[action.filePath]) {
+              // If it's not in the tree it's already gone
+              newTreeFiles[action.filePath].sha = null;
+            }
             break;
           }
           case "download":
@@ -751,7 +924,9 @@ export default class SyncManager {
         }
         const remoteFile = filesMetadata[filePath];
         const localFile = this.metadataStore.data.files[filePath];
-        if (remoteFile.deleted && localFile.deleted) {
+        if (remoteFile.deleted || localFile.deleted) {
+          // A deleted file has no content to compare, which side wins is
+          // decided when determining the sync actions.
           return null;
         }
         const actualLocalSHA = await this.calculateSHA(filePath);
@@ -808,6 +983,7 @@ export default class SyncManager {
    * @param remoteFiles All files in the remote repo
    * @param localFiles All files in the local vault
    * @param conflictFiles List of paths to files that have conflict with remote
+   * @param remoteTree All files in the remote repository
    *
    * @returns List of SyncActions
    */
@@ -815,6 +991,7 @@ export default class SyncManager {
     remoteFiles: { [key: string]: FileMetadata },
     localFiles: { [key: string]: FileMetadata },
     conflictFiles: string[],
+    remoteTree: { [key: string]: GetTreeResponseItem } = {},
   ) {
     let actions: SyncAction[] = [];
 
@@ -839,7 +1016,14 @@ export default class SyncManager {
         }
 
         const localSHA = await this.calculateSHA(filePath);
-        if (remoteFile.sha === localSHA) {
+        if (
+          !remoteFile.deleted &&
+          !localFile.deleted &&
+          remoteFile.sha === localSHA
+        ) {
+          // A deleted file keeps the SHA it had, so this must be checked only if
+          // the file exists on both sides or deletions would never be synced.
+          //
           // If the remote file sha is identical to the actual sha of the local file
           // there are no actions to take.
           // We calculate the SHA at the moment instead of using the one stored in the
@@ -908,21 +1092,50 @@ export default class SyncManager {
     });
 
     // Get diff for files in local but not in remote
-    Object.keys(localFiles).forEach((filePath: string) => {
-      const remoteFile = remoteFiles[filePath];
-      const localFile = localFiles[filePath];
-      if (remoteFile) {
-        // Remote file exists, we already handled it.
-        // Skip it.
-        return;
-      }
-      if (localFile.deleted) {
-        // Local is deleted and remote doesn't exist.
-        // Just remove the local reference.
-      } else {
+    // A file with a SHA has been in the remote at some point, but we can trust
+    // that only if the last successful sync was with this same remote.
+    const canTrustLocalSHAs =
+      this.metadataStore.data.syncedWith === this.remoteId();
+    await Promise.all(
+      Object.keys(localFiles).map(async (filePath: string) => {
+        const remoteFile = remoteFiles[filePath];
+        const localFile = localFiles[filePath];
+        if (remoteFile) {
+          // Remote file exists, we already handled it.
+          // Skip it.
+          return;
+        }
+        if (localFile.deleted) {
+          // Local is deleted and remote doesn't exist.
+          // Nothing to do.
+          return;
+        }
+        if (
+          canTrustLocalSHAs &&
+          localFile.sha !== null &&
+          !remoteTree[filePath]
+        ) {
+          // We synced this file in the past but now there's no trace of it in
+          // the remote. It has been deleted from another device and it's not
+          // tracked as deleted anymore.
+          const localSHA = await this.calculateSHA(filePath);
+          if (localSHA === null) {
+            // It's gone locally too
+            localFile.deleted = true;
+            localFile.deletedAt = Date.now();
+            return;
+          }
+          if (localSHA === localFile.sha) {
+            // It has not changed since the last sync, it's safe to delete it
+            actions.push({ type: "delete_local", filePath: filePath });
+            return;
+          }
+          // It has been edited locally after the last sync, so we keep it
+          // and upload it again.
+        }
         actions.push({ type: "upload", filePath: filePath });
-      }
-    });
+      }),
+    );
 
     if (!this.settings.syncConfigDir) {
       // Remove all actions that involve the config directory if the user doesn't want to sync it.
@@ -996,12 +1209,15 @@ export default class SyncManager {
     // This also makes it easier to handle conflicts.
     // We don't save the metadata file after setting the SHAs cause we do that when
     // the sync is fully commited at the end.
-    // TODO: Understand whether it's a problem we don't revert the SHA setting in case of sync failure
+    // The SHAs are set in the local metadata only when the sync is fully commited,
+    // if they were set and the sync failed we would believe files that never
+    // reached the remote have been synced.
     //
     // In here we also upload blob is file is a binary. We do it here because when uploading a blob we
     // also get back its SHA, so we can set it together with other files.
     // We also do that right before creating the new tree because we need the SHAs of those blob to
     // correctly create it.
+    const newSHAs: { [key: string]: string | null } = {};
     await Promise.all(
       Object.keys(treeFiles)
         .filter((filePath: string) => treeFiles[filePath].content)
@@ -1010,8 +1226,7 @@ export default class SyncManager {
           // to determine the file type, though I feel it's ok to compromise and rely
           // on them if it makes the plugin handle upload better on certain devices.
           if (hasTextExtension(filePath)) {
-            const sha = await this.calculateSHA(filePath);
-            this.metadataStore.data.files[filePath].sha = sha;
+            newSHAs[filePath] = await this.calculateSHA(filePath);
             return;
           }
 
@@ -1028,14 +1243,27 @@ export default class SyncManager {
           treeFiles[filePath].sha = sha;
           // Can't have both sha and content set, so we delete it
           delete treeFiles[filePath].content;
-          this.metadataStore.data.files[filePath].sha = sha;
+          newSHAs[filePath] = sha;
         }),
     );
 
     // Update manifest in list of new tree items
     delete treeFiles[`${this.vault.configDir}/${MANIFEST_FILE_NAME}`].sha;
+    const setSyncedState = (metadata: Metadata) => {
+      Object.keys(newSHAs)
+        .filter((filePath: string) => metadata.files[filePath])
+        .forEach((filePath: string) => {
+          metadata.files[filePath].sha = newSHAs[filePath];
+        });
+      metadata.syncedWith = this.remoteId();
+    };
+    // The remote manifest must describe the state after this sync
+    const remoteMetadata: Metadata = JSON.parse(
+      JSON.stringify(this.metadataStore.data),
+    );
+    setSyncedState(remoteMetadata);
     treeFiles[`${this.vault.configDir}/${MANIFEST_FILE_NAME}`].content =
-      JSON.stringify(this.metadataStore.data);
+      JSON.stringify(remoteMetadata);
 
     // Create the new tree
     const newTree: { tree: NewTreeRequestItem[]; base_tree: string } = {
@@ -1059,6 +1287,9 @@ export default class SyncManager {
     });
 
     await this.client.updateBranchHead({ sha: commitSha, retry: true });
+
+    // The sync is commited, now the files we uploaded are in the remote
+    setSyncedState(this.metadataStore.data);
 
     // Update the local content of all files that had conflicts we resolved
     await Promise.all(
@@ -1182,41 +1413,8 @@ export default class SyncManager {
    */
   async addConfigDirToMetadata() {
     await this.logger.info("Adding config dir to metadata");
-    // Get all the files in the config dir
-    let files = [];
-    let folders = [this.vault.configDir];
-    while (folders.length > 0) {
-      const folder = folders.pop();
-      if (folder === undefined) {
-        continue;
-      }
-      const res = await this.vault.adapter.list(folder);
-      files.push(...res.files);
-      folders.push(...res.folders);
-    }
-    // Add them to the metadata store
-    files.forEach((filePath: string) => {
-      if (
-        filePath === `${this.vault.configDir}/workspace.json` ||
-        filePath === `${this.vault.configDir}/workspace-mobile.json` ||
-        filePath === `${this.vault.configDir}/${LOG_FILE_NAME}`
-      ) {
-        // Obsidian recommends not syncing the workspace files, and the
-        // log file must never be synced.
-        return;
-      }
-      if (this.gitignore.ignores(filePath)) {
-        return;
-      }
-      this.metadataStore.data.files[filePath] = {
-        path: filePath,
-        sha: null,
-        dirty: false,
-        justDownloaded: false,
-        lastModified: Date.now(),
-      };
-    });
-    this.metadataStore.save();
+    await this.trackHiddenFoldersChanges();
+    await this.metadataStore.save();
   }
 
   /**

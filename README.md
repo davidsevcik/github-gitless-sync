@@ -2,6 +2,12 @@
 
 Plugin to sync a GitHub repository with an Obsidian vault.
 
+> [!NOTE]
+> This is a fork of [GitHub Gitless Sync](https://github.com/silvanocerza/github-gitless-sync) by
+> [Silvano Cerza](https://silvanocerza.com), maintained by David Sevcik and modified since November 2026.
+> It's not the version you find in the Obsidian community plugins, see [what's different](#changes-from-the-original-plugin).
+> If you have a problem with this fork don't report it to the original project, open an issue [here](https://github.com/davidsevcik/github-gitless-sync/issues).
+
 I highly recommend not using this plugin with another sync service.
 This might create problems for this plugin when determining what needs to be synced between remote repository and local vault.
 
@@ -15,18 +21,31 @@ These are the main features of the plugin:
 - Automatic sync on fixed interval
 - Manual sync
 - Conflict resolution view
-
-- Filtering by file type (TODO 🔨)
+- Sync of configs, plugins and other hidden folders
+- Excluding files with a `.gitignore`
 
 ## Installation
 
-The plugin is available as a community plugin, you can easily search for it in Obsidian and install it from there.
+This fork is not available as a community plugin, searching for it in Obsidian installs the original plugin.
 
-![Obsidian community plugin settings](./assets/install_instructions.png)
+The easiest way to install it, and to keep it updated, is with [BRAT](https://github.com/TfTHacker/obsidian42-brat):
+
+1. Install the BRAT community plugin and enable it
+2. Run the `BRAT: Add a beta plugin for testing` command
+3. Enter `davidsevcik/github-gitless-sync`
+
+You can also install it manually by downloading `main.js`, `manifest.json` and `styles.css` from the
+[latest release](https://github.com/davidsevcik/github-gitless-sync/releases/latest) and copying them to
+the `.obsidian/plugins/github-gitless-sync` folder of your vault.
+
+> [!WARNING]
+> This fork has the same plugin ID as the original one, so you can't have both installed in the same vault.
+> If the original plugin releases a newer version Obsidian might offer to update to it, don't do that
+> or it will replace this fork.
 
 ### Issues
 
-If you find any problem please open an issue with as many details as possible.
+If you find any problem please open an [issue](https://github.com/davidsevcik/github-gitless-sync/issues) with as many details as possible.
 
 Please also provide logs if possible, you can copy them from the settings page. Remember to enable logging first.
 
@@ -138,6 +157,18 @@ If you need to reset the plugin settings and metadata you can easily do that in 
 
 That will completely wipe all the sync metadata so you'll have to repeat the first sync as if you just enabled the plugin for the first time.
 
+## Changes from the original plugin
+
+This fork started from version 1.0.7 of the original plugin. These are the differences:
+
+- The first sync downloads the configs of the remote repository in a new vault, if config sync is enabled
+- Files added or removed in the config folder, and in any other hidden folder, are synced. For example when installing or uninstalling a plugin
+- Files can be excluded from syncing with a `.gitignore`
+- The settings of this plugin, that contain the GitHub token, are never synced
+- Deleted files are deleted from the other devices too, and are tracked for 30 days instead of forever
+- A sync can't revert the changes of the previous one, or overwrite changes made to the remote repository while syncing
+- Sync commits and notifications tell which files changed, and commits tell the device too
+
 ## FAQs
 
 ### What's different from other sync plugins?
@@ -166,7 +197,9 @@ Other plugins don't know about that file, so if you sync with others too you ris
 
 Contributions are obviously accepted.
 
-Bug fixes are always welcome, new feature must be discussed first. Open a [discussion](https://github.com/silvanocerza/github-gitless-sync/discussions) and let's talk in that case.
+Bug fixes are always welcome, new feature must be discussed first. Open an [issue](https://github.com/davidsevcik/github-gitless-sync/issues) and let's talk in that case.
+
+If your change makes sense for the original plugin too, consider contributing it [there](https://github.com/silvanocerza/github-gitless-sync).
 
 Keep PRs as small as possible, I won't review PRs with hundreds of lines if it's mostly code.
 
@@ -175,3 +208,5 @@ Low quality or vibe coded PRs are not welcome. Put some effort in it please.
 ## License
 
 The project is licensed under the [AGPLv3](https://www.gnu.org/licenses/agpl-3.0.en.html) license.
+
+The original plugin is the work of [Silvano Cerza](https://silvanocerza.com), this fork is distributed under the same license.

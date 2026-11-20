@@ -1,7 +1,7 @@
 {
   "name": "github-gitless-sync",
   "version": "1.0.10",
-  "description": "Sync a GitHub repository with vaults on different platforms without requiring git installation",
+  "description": "Sync a GitHub repository with vaults on different platforms without requiring git installation. Fork of Silvano Cerza's plugin.",
   "main": "main.js",
   "scripts": {
     "dev": "node esbuild.config.mjs",
@@ -10,7 +10,10 @@
     "benchmark": "tsx benchmark.ts"
   },
   "keywords": [],
-  "author": "Silvano Cerza",
+  "author": "David Sevcik",
+  "contributors": [
+    "Silvano Cerza (original author, https://silvanocerza.com)"
+  ],
   "license": "AGPL-3.0-only",
   "devDependencies": {
     "@types/node": "^22.10.5",

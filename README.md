@@ -101,6 +101,24 @@ afterwards to apply them.
 > DO NOT sync configs if your remote repository is public.
 > That will expose the token you used to sync.
 
+### Ignoring files
+
+If you want to exclude some files from syncing, create a `.gitignore` file in the root of your vault.
+It uses the same syntax git uses, for example:
+
+```gitignore
+# Logs and temporary files
+*.log
+*.tmp
+.obsidian/plugins/*/cache/
+```
+
+Ignored files are never uploaded, downloaded or deleted by the plugin.
+The `.gitignore` file itself is synced like any other file, so the same rules apply on all your devices.
+
+Only the `.gitignore` in the vault root is read, those in other folders are not.
+If a file was already synced before you ignored it, it stays in the remote repository until you delete it from there.
+
 ### Reset
 
 If you need to reset the plugin settings and metadata you can easily do that in the settings.

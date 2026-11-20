@@ -20,6 +20,7 @@ import { GitHubSyncSettings } from "./settings/settings";
 import Logger, { LOG_FILE_NAME } from "./logger";
 import { decodeBase64String, hasTextExtension } from "./utils";
 import GitHubSyncPlugin from "./main";
+import GitIgnore, { GITIGNORE_FILE_NAME } from "./gitignore";
 import { BlobReader, Entry, Uint8ArrayWriter, ZipReader } from "@zip.js/zip.js";
 
 // Must be the same as the id in manifest.json
@@ -49,6 +50,7 @@ export default class SyncManager {
   private metadataStore: MetadataStore;
   private client: GithubClient;
   private eventsListener: EventsListener;
+  private gitignore: GitIgnore;
   private syncIntervalId: number | null = null;
 
   // Use to track if syncing is in progress, this ideally
@@ -64,12 +66,58 @@ export default class SyncManager {
   ) {
     this.metadataStore = new MetadataStore(this.vault);
     this.client = new GithubClient(this.settings, this.logger);
+    this.gitignore = new GitIgnore(this.vault);
     this.eventsListener = new EventsListener(
       this.vault,
       this.metadataStore,
       this.settings,
       this.logger,
+      this.gitignore,
     );
+  }
+
+  /**
+   * Makes sure the metadata reflects the state of the local .gitignore file.
+   * Obsidian doesn't send events for hidden files so we can't rely on the
+   * events listener to know when it's created or deleted.
+   * Changes to its content are found when syncing by comparing SHAs.
+   */
+  private async trackGitignore() {
+    const exists = await this.vault.adapter.exists(GITIGNORE_FILE_NAME);
+    const metadata = this.metadataStore.data.files[GITIGNORE_FILE_NAME];
+    if (exists && (!metadata || metadata.deleted)) {
+      this.metadataStore.data.files[GITIGNORE_FILE_NAME] = {
+        path: GITIGNORE_FILE_NAME,
+        sha: null,
+        dirty: true,
+        justDownloaded: false,
+        lastModified: Date.now(),
+      };
+    } else if (!exists && metadata && !metadata.deleted) {
+      metadata.deleted = true;
+      metadata.deletedAt = Date.now();
+    }
+  }
+
+  /**
+   * Removes the ignored files from a list of files metadata.
+   * Files that are not tracked are never uploaded, downloaded or deleted.
+   */
+  private removeIgnoredFiles(files: { [key: string]: FileMetadata }) {
+    Object.keys(files)
+      .filter((filePath: string) => this.gitignore.ignores(filePath))
+      .forEach((filePath: string) => delete files[filePath]);
+  }
+
+  /**
+   * Loads the ignore rules and updates the local metadata accordingly.
+   * Must be called before starting any sync.
+   */
+  private async prepareIgnoredFiles() {
+    await this.gitignore.load();
+    await this.trackGitignore();
+    this.removeIgnoredFiles(this.metadataStore.data.files);
+    await this.metadataStore.save();
   }
 
   /**
@@ -121,11 +169,14 @@ export default class SyncManager {
       this.syncing = false;
       throw err;
     }
+    // We might have downloaded a new .gitignore
+    await this.gitignore.load();
     this.syncing = false;
   }
 
   private async firstSyncImpl() {
     await this.logger.info("Starting first sync");
+    await this.prepareIgnoredFiles();
     let repositoryIsEmpty = false;
     let res: RepoContent;
     let files: {
@@ -218,6 +269,22 @@ export default class SyncManager {
       length: entries.length,
     });
 
+    // The .gitignore in the remote repo is going to overwrite the local one,
+    // if any, so its rules are the ones to follow from the start. If we don't
+    // we would download files that must be ignored and upload local ones too.
+    const gitignoreEntry = entries.find(
+      (entry: Entry) =>
+        !entry.directory &&
+        entry.filename.split("/").slice(1).join("/") === GITIGNORE_FILE_NAME,
+    );
+    if (gitignoreEntry) {
+      const writer = new Uint8ArrayWriter();
+      await gitignoreEntry.getData!(writer);
+      this.gitignore.setRules(new TextDecoder().decode(await writer.getData()));
+      this.removeIgnoredFiles(this.metadataStore.data.files);
+      await this.metadataStore.save();
+    }
+
     await Promise.all(
       entries.map(async (entry: Entry) => {
         // All repo ZIPs contain a root directory that contains all the content
@@ -254,6 +321,11 @@ export default class SyncManager {
           return;
         }
 
+        if (this.gitignore.ignores(targetPath)) {
+          await this.logger.info("Skipped ignored file", { targetPath });
+          return;
+        }
+
         if (entry.directory) {
           const normalizedPath = normalizePath(targetPath);
           await this.vault.adapter.mkdir(normalizedPath);
@@ -271,9 +343,13 @@ export default class SyncManager {
           return;
         }
 
-        if (targetPath.split("/").last()?.startsWith(".")) {
+        if (
+          targetPath !== GITIGNORE_FILE_NAME &&
+          targetPath.split("/").last()?.startsWith(".")
+        ) {
           // We must skip hidden files as that creates issues with syncing.
           // This is fine as users can't edit hidden files in Obsidian anyway.
+          // The .gitignore is the exception since we need its rules.
           await this.logger.info("Skipping hidden file", targetPath);
           return;
         }
@@ -439,12 +515,15 @@ export default class SyncManager {
       // the user sees it.
       new Notice(`Error syncing. ${err}`);
     }
+    // We might have downloaded a new .gitignore
+    await this.gitignore.load();
     this.syncing = false;
     notice.hide();
   }
 
   private async syncImpl() {
     await this.logger.info("Starting sync");
+    await this.prepareIgnoredFiles();
     const { files, sha: treeSha } = await this.client.getRepoContent({
       retry: true,
     });
@@ -469,6 +548,24 @@ export default class SyncManager {
     const remoteMetadata: Metadata = JSON.parse(
       decodeBase64String(blob.content),
     );
+
+    if (
+      files[GITIGNORE_FILE_NAME] &&
+      !remoteMetadata.files[GITIGNORE_FILE_NAME]
+    ) {
+      // The .gitignore has been added to the repo by something else, like git,
+      // so it's not in the manifest. We treat it as if it was or it would
+      // never be downloaded.
+      remoteMetadata.files[GITIGNORE_FILE_NAME] = {
+        path: GITIGNORE_FILE_NAME,
+        sha: files[GITIGNORE_FILE_NAME].sha,
+        dirty: false,
+        justDownloaded: false,
+        lastModified: 0,
+      };
+    }
+    // Ignored files that are still tracked remotely must be left alone
+    this.removeIgnoredFiles(remoteMetadata.files);
 
     const conflicts = await this.findConflicts(remoteMetadata.files);
 
@@ -517,7 +614,7 @@ export default class SyncManager {
       }
     }
 
-    const actions: SyncAction[] = [
+    const determineActions = async (): Promise<SyncAction[]> => [
       ...(await this.determineSyncActions(
         remoteMetadata.files,
         this.metadataStore.data.files,
@@ -525,6 +622,32 @@ export default class SyncManager {
       )),
       ...conflictActions,
     ];
+    let actions = await determineActions();
+
+    if (
+      actions.some(
+        (action) =>
+          action.type === "download" && action.filePath === GITIGNORE_FILE_NAME,
+      )
+    ) {
+      // The remote .gitignore is newer than ours. Its rules must be applied to
+      // this same sync or we would upload and download files that must be ignored,
+      // so we download it right away and determine the actions again.
+      await this.downloadFile(
+        files[GITIGNORE_FILE_NAME],
+        remoteMetadata.files[GITIGNORE_FILE_NAME].lastModified,
+      );
+      await this.gitignore.load();
+      this.removeIgnoredFiles(this.metadataStore.data.files);
+      this.removeIgnoredFiles(remoteMetadata.files);
+      conflictActions = conflictActions.filter(
+        (action) => !this.gitignore.ignores(action.filePath),
+      );
+      conflictResolutions = conflictResolutions.filter(
+        (resolution) => !this.gitignore.ignores(resolution.filePath),
+      );
+      actions = await determineActions();
+    }
 
     if (actions.length === 0) {
       // Nothing to sync
@@ -995,6 +1118,7 @@ export default class SyncManager {
   async loadMetadata() {
     await this.logger.info("Loading metadata");
     await this.metadataStore.load();
+    await this.gitignore.load();
     if (Object.keys(this.metadataStore.data.files).length === 0) {
       await this.logger.info("Metadata was empty, loading all files");
       let files = [];
@@ -1009,6 +1133,10 @@ export default class SyncManager {
           // Skip the config dir if the user doesn't want to sync it
           continue;
         }
+        if (this.gitignore.ignores(`${folder}/`)) {
+          await this.logger.info("Skipping ignored folder", folder);
+          continue;
+        }
         const res = await this.vault.adapter.list(folder);
         files.push(...res.files);
         folders.push(...res.folders);
@@ -1016,6 +1144,9 @@ export default class SyncManager {
       files.forEach((filePath: string) => {
         if (filePath === `${this.vault.configDir}/workspace.json`) {
           // Obsidian recommends not syncing the workspace file
+          return;
+        }
+        if (this.gitignore.ignores(filePath)) {
           return;
         }
 
@@ -1072,6 +1203,9 @@ export default class SyncManager {
       ) {
         // Obsidian recommends not syncing the workspace files, and the
         // log file must never be synced.
+        return;
+      }
+      if (this.gitignore.ignores(filePath)) {
         return;
       }
       this.metadataStore.data.files[filePath] = {

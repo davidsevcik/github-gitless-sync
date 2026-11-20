@@ -3,6 +3,7 @@ import MetadataStore, { MANIFEST_FILE_NAME } from "./metadata-store";
 import { GitHubSyncSettings } from "./settings/settings";
 import Logger, { LOG_FILE_NAME } from "./logger";
 import GitHubSyncPlugin from "./main";
+import GitIgnore from "./gitignore";
 
 /**
  * Tracks changes to local sync directory and updates files metadata.
@@ -13,6 +14,7 @@ export default class EventsListener {
     private metadataStore: MetadataStore,
     private settings: GitHubSyncSettings,
     private logger: Logger,
+    private gitignore: GitIgnore,
   ) {}
 
   start(plugin: GitHubSyncPlugin) {
@@ -100,8 +102,14 @@ export default class EventsListener {
       );
       return;
     }
-    this.metadataStore.data.files[file.path].lastModified = Date.now();
-    this.metadataStore.data.files[file.path].dirty = true;
+    if (!data) {
+      // The file is not tracked, this can happen if it was ignored and
+      // it's not anymore. Handle it as if it has just been created.
+      await this.onCreate(file);
+      return;
+    }
+    data.lastModified = Date.now();
+    data.dirty = true;
     await this.metadataStore.save();
     await this.logger.info("Updated modified file", file.path);
   }
@@ -147,6 +155,9 @@ export default class EventsListener {
       return false;
     } else if (filePath === `${this.vault.configDir}/${LOG_FILE_NAME}`) {
       // Don't sync the log file, doesn't make sense
+      return false;
+    } else if (this.gitignore.ignores(filePath)) {
+      // The user doesn't want to sync this
       return false;
     } else if (
       this.settings.syncConfigDir &&

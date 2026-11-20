@@ -65,3 +65,63 @@ export function buildCommitMessage(
   }
   return `${subject}\n\n${body.join("\n\n")}`;
 }
+
+/**
+ * The changes a sync applies to the local vault.
+ */
+export interface LocalChanges {
+  downloaded: string[];
+  deleted: string[];
+}
+
+/**
+ * Describes a list of changes in a single line, naming the file
+ * if there's only one and counting them otherwise.
+ */
+function describeChanges(
+  sections: { label: string; files: string[] }[],
+): string {
+  const changed = sections.filter((section) => section.files.length > 0);
+  const total = changed.reduce((sum, s) => sum + s.files.length, 0);
+  if (total === 1) {
+    return `${changed[0].label} ${changed[0].files[0]}`;
+  }
+  return changed
+    .map((section) => `${section.files.length} ${section.label}`)
+    .join(", ");
+}
+
+/**
+ * Builds the text shown to the user when a sync is done, it tells what
+ * has been sent to the remote repository and what has been received.
+ *
+ * @param sent Files changed in the remote repository, same as in the sync commit
+ * @param received Files changed in the local vault
+ */
+export function buildSyncSummary(
+  sent: CommitChanges,
+  received: LocalChanges,
+): string {
+  const lines: string[] = [];
+  if (sent.added.length + sent.updated.length + sent.deleted.length > 0) {
+    lines.push(
+      `Sent: ${describeChanges([
+        { label: "added", files: sent.added },
+        { label: "updated", files: sent.updated },
+        { label: "deleted", files: sent.deleted },
+      ])}`,
+    );
+  }
+  if (received.downloaded.length + received.deleted.length > 0) {
+    lines.push(
+      `Received: ${describeChanges([
+        { label: "downloaded", files: received.downloaded },
+        { label: "deleted", files: received.deleted },
+      ])}`,
+    );
+  }
+  if (lines.length === 0) {
+    return "Nothing to sync";
+  }
+  return `Sync successful\n${lines.join("\n")}`;
+}

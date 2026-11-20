@@ -5,7 +5,10 @@ import { retryUntil } from "src/utils";
 
 export type RepoContent = {
   files: { [key: string]: GetTreeResponseItem };
+  // SHA of the tree
   sha: string;
+  // SHA of the commit the tree belongs to, the branch head when we read it
+  headSha: string;
 };
 
 /**
@@ -84,10 +87,16 @@ export default class GithubClient {
     retry = false,
     maxRetries = 5,
   } = {}): Promise<RepoContent> {
+    // We must not get the tree using the branch name. GitHub lets clients cache
+    // responses for a minute, so syncing twice in a short time would get us the
+    // old tree and manifest, and we would revert the changes of the previous sync.
+    // Instead we get the branch head, making sure it's not cached, and then its
+    // tree by SHA. That one can be cached safely as it never changes.
+    const headSha = await this.getBranchHeadSha({ retry, maxRetries });
     const response = await retryUntil(
       async () => {
         return requestUrl({
-          url: `https://api.github.com/repos/${this.settings.githubOwner}/${this.settings.githubRepo}/git/trees/${this.settings.githubBranch}?recursive=1`,
+          url: `https://api.github.com/repos/${this.settings.githubOwner}/${this.settings.githubRepo}/git/trees/${headSha}?recursive=1`,
           headers: this.headers(),
           throw: false,
         });
@@ -113,7 +122,7 @@ export default class GithubClient {
         ) => ({ ...acc, [file.path]: file }),
         {},
       );
-    return { files, sha: response.json.sha };
+    return { files, sha: response.json.sha, headSha };
   }
 
   /**
@@ -219,8 +228,11 @@ export default class GithubClient {
     const response = await retryUntil(
       async () => {
         return requestUrl({
-          url: `https://api.github.com/repos/${this.settings.githubOwner}/${this.settings.githubRepo}/git/refs/heads/${this.settings.githubBranch}`,
-          headers: this.headers(),
+          // The branch head changes at every sync so we must never get a cached
+          // response. The header should be enough, the timestamp makes the URL
+          // unique in case the platform ignores it.
+          url: `https://api.github.com/repos/${this.settings.githubOwner}/${this.settings.githubRepo}/git/refs/heads/${this.settings.githubBranch}?t=${Date.now()}`,
+          headers: { ...this.headers(), "Cache-Control": "no-cache" },
           throw: false,
         });
       },
@@ -270,6 +282,15 @@ export default class GithubClient {
       retry ? maxRetries : 0,
     );
 
+    if (response.status === 422) {
+      // The new commit is not a descendant of the branch head, so something
+      // else changed the remote after we read it.
+      await this.logger.error("Branch head changed during sync", response);
+      throw new GithubAPIError(
+        response.status,
+        "The remote repository changed while syncing, nothing has been uploaded. Sync again.",
+      );
+    }
     if (response.status < 200 || response.status >= 400) {
       await this.logger.error("Failed to update branch head sha", response);
       throw new GithubAPIError(

@@ -154,11 +154,16 @@ export default class GitHubSyncPlugin extends Plugin {
     if (this.settings.firstSync) {
       const notice = new Notice("Syncing...");
       try {
-        await this.syncManager.firstSync();
+        const summary = await this.syncManager.firstSync();
+        if (summary === undefined) {
+          // A first sync is already in progress, it will notify when done
+          notice.hide();
+          return;
+        }
         this.settings.firstSync = false;
         this.saveSettings();
         // Shown only if sync doesn't fail
-        new Notice("Sync successful", 5000);
+        new Notice(summary, 5000);
         if (this.settings.syncConfigDir) {
           // Obsidian doesn't pick up config changes on disk while running.
           // Not automatically dismissed so the user sees it.

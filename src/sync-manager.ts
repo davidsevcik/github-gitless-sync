@@ -18,7 +18,11 @@ import MetadataStore, {
 } from "./metadata-store";
 import EventsListener from "./events-listener";
 import { GitHubSyncSettings, PLUGIN_ID } from "./settings/settings";
-import { CommitChanges, buildCommitMessage } from "./commit-message";
+import {
+  CommitChanges,
+  buildCommitMessage,
+  buildSyncSummary,
+} from "./commit-message";
 import Logger, { LOG_FILE_NAME } from "./logger";
 import { decodeBase64String, hasTextExtension } from "./utils";
 import GitHubSyncPlugin from "./main";
@@ -66,6 +70,11 @@ export default class SyncManager {
   // prevents multiple syncs at the same time and creation
   // of messy conflicts.
   private syncing: boolean = false;
+
+  // SHA of the branch head at the time we read the remote content in the
+  // current sync. The sync commit must be its child, so if anything else
+  // changes the remote in the meantime the sync fails instead of overwriting it.
+  private remoteHeadSha: string = "";
 
   constructor(
     private vault: Vault,
@@ -342,7 +351,7 @@ export default class SyncManager {
    * Handles first sync with remote and local.
    * This fails if neither remote nor local folders are empty.
    */
-  async firstSync() {
+  async firstSync(): Promise<string | undefined> {
     if (this.syncing) {
       this.logger.info("First sync already in progress");
       // We're already syncing, nothing to do
@@ -350,8 +359,9 @@ export default class SyncManager {
     }
 
     this.syncing = true;
+    let summary: string;
     try {
-      await this.firstSyncImpl();
+      summary = await this.firstSyncImpl();
     } catch (err) {
       this.syncing = false;
       throw err;
@@ -359,9 +369,10 @@ export default class SyncManager {
     // We might have downloaded a new .gitignore
     await this.gitignore.load();
     this.syncing = false;
+    return summary;
   }
 
-  private async firstSyncImpl() {
+  private async firstSyncImpl(): Promise<string> {
     await this.logger.info("Starting first sync");
     await this.refreshLocalMetadata();
     let repositoryIsEmpty = false;
@@ -374,6 +385,7 @@ export default class SyncManager {
       res = await this.client.getRepoContent();
       files = res.files;
       treeSha = res.sha;
+      this.remoteHeadSha = res.headSha;
     } catch (err) {
       // 409 is returned in case the remote repo has been just created
       // and contains no files.
@@ -408,6 +420,7 @@ export default class SyncManager {
       res = await this.client.getRepoContent({ retry: true });
       files = res.files;
       treeSha = res.sha;
+      this.remoteHeadSha = res.headSha;
     }
 
     const vaultIsEmpty = await this.vaultIsEmpty();
@@ -420,13 +433,13 @@ export default class SyncManager {
       // Remote has no files and no manifest, let's just upload whatever we have locally.
       // This is fine even if the vault is empty.
       // The most important thing at this point is that the remote manifest is created.
-      await this.firstSyncFromLocal(files, treeSha);
+      return await this.firstSyncFromLocal(files, treeSha);
     } else {
       // Local has no files and there's no manifest in the remote repo.
       // Let's download whatever we have in the remote repo.
       // This is fine even if the remote repo is empty.
       // In this case too the important step is that the remote manifest is created.
-      await this.firstSyncFromRemote(files, treeSha);
+      return await this.firstSyncFromRemote(files, treeSha);
     }
   }
 
@@ -441,8 +454,9 @@ export default class SyncManager {
   private async firstSyncFromRemote(
     files: { [key: string]: GetTreeResponseItem },
     treeSha: string,
-  ) {
+  ): Promise<string> {
     await this.logger.info("Starting first sync from remote files");
+    const downloaded: string[] = [];
 
     // We want to avoid getting throttled by GitHub, so instead of making a request for each
     // file we download the whole repository as a ZIP file and extract it in the vault.
@@ -558,6 +572,7 @@ export default class SyncManager {
         await this.logger.info("Written file", {
           normalizedPath,
         });
+        downloaded.push(normalizedPath);
         this.metadataStore.data.files[normalizedPath] = {
           path: normalizedPath,
           sha: files[normalizedPath].sha,
@@ -617,13 +632,18 @@ export default class SyncManager {
           };
         }),
     );
-    await this.commitSync(
+    const sent = await this.commitSync(
       newTreeFiles,
       treeSha,
       { added, updated: [], deleted: [] },
       [],
       true,
     );
+    const manifestPath = `${this.vault.configDir}/${MANIFEST_FILE_NAME}`;
+    return buildSyncSummary(sent, {
+      downloaded: downloaded.filter((filePath) => filePath !== manifestPath),
+      deleted: [],
+    });
   }
 
   /**
@@ -637,8 +657,9 @@ export default class SyncManager {
   private async firstSyncFromLocal(
     files: { [key: string]: GetTreeResponseItem },
     treeSha: string,
-  ) {
+  ): Promise<string> {
     await this.logger.info("Starting first sync from local files");
+    const downloaded: string[] = [];
     const added: string[] = [];
     const newTreeFiles = Object.keys(files)
       .map((filePath: string) => ({
@@ -687,13 +708,18 @@ export default class SyncManager {
           };
         }),
     );
-    await this.commitSync(
+    const sent = await this.commitSync(
       newTreeFiles,
       treeSha,
       { added, updated: [], deleted: [] },
       [],
       true,
     );
+    const manifestPath = `${this.vault.configDir}/${MANIFEST_FILE_NAME}`;
+    return buildSyncSummary(sent, {
+      downloaded: downloaded.filter((filePath) => filePath !== manifestPath),
+      deleted: [],
+    });
   }
 
   /**
@@ -710,9 +736,9 @@ export default class SyncManager {
     const notice = new Notice("Syncing...");
     this.syncing = true;
     try {
-      await this.syncImpl();
+      const summary = await this.syncImpl();
       // Shown only if sync doesn't fail
-      new Notice("Sync successful", 5000);
+      new Notice(summary, 5000);
     } catch (err) {
       // Show the error to the user, it's not automatically dismissed to make sure
       // the user sees it.
@@ -724,12 +750,17 @@ export default class SyncManager {
     notice.hide();
   }
 
-  private async syncImpl() {
+  private async syncImpl(): Promise<string> {
     await this.logger.info("Starting sync");
     await this.refreshLocalMetadata();
-    const { files, sha: treeSha } = await this.client.getRepoContent({
+    const {
+      files,
+      sha: treeSha,
+      headSha,
+    } = await this.client.getRepoContent({
       retry: true,
     });
+    this.remoteHeadSha = headSha;
     const manifest = files[`${this.vault.configDir}/${MANIFEST_FILE_NAME}`];
 
     if (manifest === undefined) {
@@ -829,6 +860,7 @@ export default class SyncManager {
       ...conflictActions,
     ];
     let actions = await determineActions();
+    const gitignoreDownloaded: string[] = [];
 
     if (
       actions.some(
@@ -843,6 +875,7 @@ export default class SyncManager {
         files[GITIGNORE_FILE_NAME],
         remoteMetadata.files[GITIGNORE_FILE_NAME].lastModified,
       );
+      gitignoreDownloaded.push(GITIGNORE_FILE_NAME);
       await this.gitignore.load();
       this.removeIgnoredFiles(this.metadataStore.data.files);
       this.removeIgnoredFiles(remoteMetadata.files);
@@ -860,7 +893,11 @@ export default class SyncManager {
       await this.logger.info("Nothing to sync");
       this.metadataStore.data.syncedWith = this.remoteId();
       await this.metadataStore.save();
-      return;
+      return buildSyncSummary(
+        { added: [], updated: [], deleted: [] },
+        // The .gitignore might have been the only change
+        { downloaded: gitignoreDownloaded, deleted: [] },
+      );
     }
     await this.logger.info("Actions to sync", actions);
 
@@ -947,7 +984,23 @@ export default class SyncManager {
         )
         .map((action) => action.filePath),
     };
-    await this.commitSync(newTreeFiles, treeSha, changes, conflictResolutions);
+    const sent = await this.commitSync(
+      newTreeFiles,
+      treeSha,
+      changes,
+      conflictResolutions,
+    );
+    return buildSyncSummary(sent, {
+      downloaded: [
+        ...gitignoreDownloaded,
+        ...actions
+          .filter((action) => action.type === "download")
+          .map((action) => action.filePath),
+      ],
+      deleted: actions
+        .filter((action) => action.type === "delete_local")
+        .map((action) => action.filePath),
+    });
   }
 
   /**
@@ -1232,6 +1285,8 @@ export default class SyncManager {
    * @param changes files the commit adds, updates and deletes in the remote
    * @param conflictResolutions list of conflicts between remote and local files
    * @param firstSync whether this is the first sync of this device
+   *
+   * @returns the files the commit added, updated and deleted in the remote
    */
   async commitSync(
     treeFiles: { [key: string]: NewTreeRequestItem },
@@ -1239,7 +1294,7 @@ export default class SyncManager {
     changes: CommitChanges,
     conflictResolutions: ConflictResolution[] = [],
     firstSync: boolean = false,
-  ) {
+  ): Promise<CommitChanges> {
     const manifestPath = `${this.vault.configDir}/${MANIFEST_FILE_NAME}`;
     const isNotManifest = (filePath: string) => filePath !== manifestPath;
     changes = {
@@ -1290,6 +1345,7 @@ export default class SyncManager {
     // We also do that right before creating the new tree because we need the SHAs of those blob to
     // correctly create it.
     const newSHAs: { [key: string]: string | null } = {};
+    const uploadedBlobs = new Set<string>();
     await Promise.all(
       Object.keys(treeFiles)
         .filter((filePath: string) => treeFiles[filePath].content)
@@ -1312,6 +1368,7 @@ export default class SyncManager {
             maxRetries: 3,
           });
           await this.logger.info("Created blob", filePath);
+          uploadedBlobs.add(filePath);
           treeFiles[filePath].sha = sha;
           // Can't have both sha and content set, so we delete it
           delete treeFiles[filePath].content;
@@ -1337,11 +1394,19 @@ export default class SyncManager {
     treeFiles[`${this.vault.configDir}/${MANIFEST_FILE_NAME}`].content =
       JSON.stringify(remoteMetadata);
 
-    // Create the new tree
+    // Create the new tree.
+    // We only send the files this sync changes, all the others are taken from
+    // the base tree. If we sent them all with the SHAs we know, we would
+    // overwrite any change made to the remote that we're not aware of.
     const newTree: { tree: NewTreeRequestItem[]; base_tree: string } = {
-      tree: Object.keys(treeFiles).map(
-        (filePath: string) => treeFiles[filePath],
-      ),
+      tree: Object.keys(treeFiles)
+        .filter(
+          (filePath: string) =>
+            treeFiles[filePath].content !== undefined ||
+            treeFiles[filePath].sha === null ||
+            uploadedBlobs.has(filePath),
+        )
+        .map((filePath: string) => treeFiles[filePath]),
       base_tree: baseTreeSha,
     };
     const newTreeSha = await this.client.createTree({
@@ -1349,15 +1414,21 @@ export default class SyncManager {
       retry: true,
     });
 
-    const branchHeadSha = await this.client.getBranchHeadSha({ retry: true });
-
+    // The parent must be the commit we read the remote content from, not the
+    // current branch head. If the two are different the branch update fails,
+    // as it must, since we don't know what changed in the meantime.
     const commitSha = await this.client.createCommit({
       message: buildCommitMessage(changes, this.deviceName(), firstSync),
       treeSha: newTreeSha,
-      parent: branchHeadSha,
+      parent: this.remoteHeadSha,
     });
 
-    await this.client.updateBranchHead({ sha: commitSha, retry: true });
+    await this.client.updateBranchHead({
+      sha: commitSha,
+      retry: true,
+      // If the branch moved retrying is not going to help, fail fast
+      maxRetries: 2,
+    });
 
     // The sync is commited, now the files we uploaded are in the remote
     setSyncedState(this.metadataStore.data);
@@ -1379,6 +1450,7 @@ export default class SyncManager {
     // we can save the latest metadata to disk.
     this.metadataStore.save();
     await this.logger.info("Sync done");
+    return changes;
   }
 
   async downloadFile(file: GetTreeResponseItem, lastModified: number) {

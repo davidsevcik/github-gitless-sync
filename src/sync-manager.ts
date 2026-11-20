@@ -1,6 +1,7 @@
 import {
   Vault,
   Notice,
+  Platform,
   normalizePath,
   base64ToArrayBuffer,
   arrayBufferToBase64,
@@ -16,7 +17,8 @@ import MetadataStore, {
   MANIFEST_FILE_NAME,
 } from "./metadata-store";
 import EventsListener from "./events-listener";
-import { GitHubSyncSettings } from "./settings/settings";
+import { GitHubSyncSettings, PLUGIN_ID } from "./settings/settings";
+import { CommitChanges, buildCommitMessage } from "./commit-message";
 import Logger, { LOG_FILE_NAME } from "./logger";
 import { decodeBase64String, hasTextExtension } from "./utils";
 import GitHubSyncPlugin from "./main";
@@ -32,9 +34,6 @@ const UNSYNCABLE_FOLDERS = [".git", ".trash"];
 // It's only needed to decide what to do if the file has been deleted on a device
 // and edited on another one, after this we fall back to comparing its content.
 const DELETED_FILES_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
-
-// Must be the same as the id in manifest.json
-const PLUGIN_ID = "github-gitless-sync";
 
 interface SyncAction {
   type: "upload" | "download" | "delete_local" | "delete_remote";
@@ -238,6 +237,29 @@ export default class SyncManager {
           metadataFiles[filePath].deletedAt = Date.now();
         }),
     );
+  }
+
+  /**
+   * Name used to identify this device in sync commits.
+   * It's the one set by the user, or the platform name if there's none.
+   */
+  private deviceName(): string {
+    const name = this.settings.deviceName?.trim();
+    if (name) {
+      return name;
+    }
+    if (Platform?.isIosApp) {
+      return "iOS";
+    } else if (Platform?.isAndroidApp) {
+      return "Android";
+    } else if (Platform?.isMacOS) {
+      return "macOS";
+    } else if (Platform?.isWin) {
+      return "Windows";
+    } else if (Platform?.isLinux) {
+      return "Linux";
+    }
+    return "Obsidian";
   }
 
   /**
@@ -564,12 +586,14 @@ export default class SyncManager {
         {},
       );
     // Add files that are in the manifest but not in the tree.
+    const added: string[] = [];
     await Promise.all(
       Object.keys(this.metadataStore.data.files)
         .filter((filePath: string) => {
           return !Object.keys(files).contains(filePath);
         })
         .map(async (filePath: string) => {
+          added.push(filePath);
           const normalizedPath = normalizePath(filePath);
           // We need to check whether the file is a text file or not before
           // reading it here because trying to read a binary file as text fails
@@ -593,7 +617,13 @@ export default class SyncManager {
           };
         }),
     );
-    await this.commitSync(newTreeFiles, treeSha);
+    await this.commitSync(
+      newTreeFiles,
+      treeSha,
+      { added, updated: [], deleted: [] },
+      [],
+      true,
+    );
   }
 
   /**
@@ -609,6 +639,7 @@ export default class SyncManager {
     treeSha: string,
   ) {
     await this.logger.info("Starting first sync from local files");
+    const added: string[] = [];
     const newTreeFiles = Object.keys(files)
       .map((filePath: string) => ({
         path: files[filePath].path,
@@ -632,6 +663,7 @@ export default class SyncManager {
           return !this.metadataStore.data.files[filePath].deleted;
         })
         .map(async (filePath: string) => {
+          added.push(filePath);
           const normalizedPath = normalizePath(filePath);
           // We need to check whether the file is a text file or not before
           // reading it here because trying to read a binary file as text fails
@@ -655,7 +687,13 @@ export default class SyncManager {
           };
         }),
     );
-    await this.commitSync(newTreeFiles, treeSha);
+    await this.commitSync(
+      newTreeFiles,
+      treeSha,
+      { added, updated: [], deleted: [] },
+      [],
+      true,
+    );
   }
 
   /**
@@ -897,7 +935,19 @@ export default class SyncManager {
         }),
     ]);
 
-    await this.commitSync(newTreeFiles, treeSha, conflictResolutions);
+    const uploads = actions
+      .filter((action) => action.type === "upload")
+      .map((action) => action.filePath);
+    const changes: CommitChanges = {
+      added: uploads.filter((filePath) => !files[filePath]),
+      updated: uploads.filter((filePath) => files[filePath]),
+      deleted: actions
+        .filter(
+          (action) => action.type === "delete_remote" && files[action.filePath],
+        )
+        .map((action) => action.filePath),
+    };
+    await this.commitSync(newTreeFiles, treeSha, changes, conflictResolutions);
   }
 
   /**
@@ -1179,13 +1229,35 @@ export default class SyncManager {
    *
    * @param treeFiles Updated list of files in the remote tree
    * @param baseTreeSha sha of the tree to use as base for the new tree
+   * @param changes files the commit adds, updates and deletes in the remote
    * @param conflictResolutions list of conflicts between remote and local files
+   * @param firstSync whether this is the first sync of this device
    */
   async commitSync(
     treeFiles: { [key: string]: NewTreeRequestItem },
     baseTreeSha: string,
+    changes: CommitChanges,
     conflictResolutions: ConflictResolution[] = [],
+    firstSync: boolean = false,
   ) {
+    const manifestPath = `${this.vault.configDir}/${MANIFEST_FILE_NAME}`;
+    const isNotManifest = (filePath: string) => filePath !== manifestPath;
+    changes = {
+      added: changes.added.filter(isNotManifest),
+      updated: changes.updated.filter(isNotManifest),
+      deleted: changes.deleted.filter(isNotManifest),
+    };
+
+    // Our settings must never be in the remote as they contain the GitHub token.
+    // Older versions of the plugin synced them together with the other configs,
+    // if that's the case we remove them.
+    const pluginSettings = treeFiles[this.gitignore.pluginSettingsPath()];
+    if (pluginSettings) {
+      pluginSettings.sha = null;
+      delete pluginSettings.content;
+      changes.deleted.push(pluginSettings.path);
+    }
+
     // Update local sync time
     const syncTime = Date.now();
     this.metadataStore.data.lastSync = syncTime;
@@ -1280,8 +1352,7 @@ export default class SyncManager {
     const branchHeadSha = await this.client.getBranchHeadSha({ retry: true });
 
     const commitSha = await this.client.createCommit({
-      // TODO: Make this configurable or find a nicer commit message
-      message: "Sync",
+      message: buildCommitMessage(changes, this.deviceName(), firstSync),
       treeSha: newTreeSha,
       parent: branchHeadSha,
     });

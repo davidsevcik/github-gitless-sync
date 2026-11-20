@@ -159,5 +159,14 @@ export function base64ToArrayBuffer(base64: string): ArrayBuffer {
   return Buffer.from(base64, "base64");
 }
 
+// Mock Platform, none is set so the device has no platform name
+export const Platform = {
+  isIosApp: false,
+  isAndroidApp: false,
+  isMacOS: false,
+  isWin: false,
+  isLinux: false,
+};
+
 // Mock Event reference
 export type EventRef = string;

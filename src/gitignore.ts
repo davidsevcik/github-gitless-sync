@@ -1,6 +1,7 @@
 import { Vault } from "obsidian";
 import ignore, { Ignore } from "ignore";
 import { MANIFEST_FILE_NAME } from "./metadata-store";
+import { PLUGIN_ID } from "./settings/settings";
 
 export const GITIGNORE_FILE_NAME = ".gitignore" as const;
 
@@ -35,6 +36,13 @@ export default class GitIgnore {
   }
 
   /**
+   * Path to the file this plugin stores its settings in.
+   */
+  pluginSettingsPath(): string {
+    return `${this.vault.configDir}/plugins/${PLUGIN_ID}/data.json`;
+  }
+
+  /**
    * Returns true if the file must not be synced.
    * @param filePath Path relative to the vault root, folders must end with "/"
    */
@@ -46,6 +54,11 @@ export default class GitIgnore {
       // These must always be synced, no matter the rules, or
       // syncing would break.
       return false;
+    }
+    if (filePath === this.pluginSettingsPath()) {
+      // Our own settings are never synced, they contain the GitHub token
+      // and settings that are specific to this device.
+      return true;
     }
     try {
       return this.matcher.ignores(filePath);

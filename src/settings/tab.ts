@@ -93,6 +93,21 @@ export default class GitHubSyncSettingsTab extends PluginSettingTab {
 
     new Setting(containerEl).setName("Sync").setHeading();
 
+    new Setting(containerEl)
+      .setName("Device name")
+      .setDesc(
+        "Name used to identify this device in sync commits. If empty the platform name is used.",
+      )
+      .addText((text) =>
+        text
+          .setPlaceholder("My device")
+          .setValue(this.plugin.settings.deviceName)
+          .onChange(async (value) => {
+            this.plugin.settings.deviceName = value;
+            await this.plugin.saveSettings();
+          }),
+      );
+
     const syncStrategies = {
       manual: "Manually",
       interval: "On Interval",

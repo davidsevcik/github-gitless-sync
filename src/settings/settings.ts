@@ -1,9 +1,15 @@
+// Must be the same as the id in manifest.json
+export const PLUGIN_ID = "github-gitless-sync" as const;
+
 export interface GitHubSyncSettings {
   firstSync: boolean;
   githubToken: string;
   githubOwner: string;
   githubRepo: string;
   githubBranch: string;
+  // Name used to identify this device in sync commits.
+  // If empty the platform name is used.
+  deviceName: string;
   syncStrategy: "manual" | "interval";
   syncInterval: number;
   syncOnStartup: boolean;
@@ -22,6 +28,7 @@ export const DEFAULT_SETTINGS: GitHubSyncSettings = {
   githubOwner: "",
   githubRepo: "",
   githubBranch: "main",
+  deviceName: "",
   syncStrategy: "manual",
   syncInterval: 1,
   syncOnStartup: false,

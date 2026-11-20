@@ -101,9 +101,18 @@ Files added or removed in the config folder, like when you install or uninstall 
 when syncing. The same goes for any other hidden folder in your vault, those are always synced.
 `.git` and `.trash` folders are never synced, and neither are hidden files.
 
-> [!CAUTION]
-> DO NOT sync configs if your remote repository is public.
-> That will expose the token you used to sync.
+The settings of this plugin are never synced, as they contain your GitHub token, so you must
+configure it on each device. If they were synced by an older version they're deleted from the remote
+repository at the next sync, though they're still in its history. If your repository is public, or
+has ever been, create a new token and delete the old one.
+
+### Sync commits
+
+Each sync that changes something creates a commit in your repository. Its message tells which files
+have been added, updated and deleted, and the device that did it.
+
+By default the device is identified by its platform, like `macOS` or `iOS`. You can set a different
+name for each device in the settings.
 
 ### Ignoring files
 
